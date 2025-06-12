@@ -19,8 +19,10 @@ limitations under the License.
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -60,24 +62,25 @@ import (
 )
 
 var (
-	nItemsFlag      = flag.Int("n", -1, "number of items to download. If negative, get them all.")
-	devFlag         = flag.Bool("dev", false, "dev mode. we reuse the same session dir (/tmp/gphotos-cdp), so we don't have to auth at every run.")
-	downloadDirFlag = flag.String("dldir", "", "where to write the downloads. defaults to $HOME/Downloads/gphotos-cdp.")
-	profileFlag     = flag.String("profile", "", "like -dev, but with a user-provided profile dir")
-	fromFlag        = flag.String("from", "", "earliest date to sync (YYYY-MM-DD)")
-	toFlag          = flag.String("to", "", "latest date to sync (YYYY-MM-DD)")
-	untilFlag       = flag.String("until", "", "stop syncing at this photo")
-	runFlag         = flag.String("run", "", "the program to run on each downloaded item, right after it is dowloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
-	verboseFlag     = flag.Bool("v", false, "be verbose")
-	headlessFlag    = flag.Bool("headless", false, "Start chrome browser in headless mode (must use -dev and have already authenticated).")
-	jsonLogFlag     = flag.Bool("json", false, "output logs in JSON format")
-	logLevelFlag    = flag.String("loglevel", "", "log level: debug, info, warn, error, fatal, panic")
-	removedFlag     = flag.Bool("removed", false, "save list of files found locally that appear to be deleted from Google Photos")
-	workersFlag     = flag.Int64("workers", 1, "number of concurrent downloads allowed")
-	albumIdFlag     = flag.String("album", "", "ID of album to download, has no effect if lastdone file is found or if -start contains full URL")
-	albumTypeFlag   = flag.String("albumtype", "album", "type of album to download (as seen in URL), has no effect if lastdone file is found or if -start contains full URL")
-	batchSizeFlag   = flag.Int("batchsize", 0, "number of photos to download in one batch")
-	execPathFlag    = flag.String("execpath", "", "path to Chrome/Chromium binary to use")
+	nItemsFlag               = flag.Int("n", -1, "number of items to download. If negative, get them all.")
+	devFlag                  = flag.Bool("dev", false, "dev mode. we reuse the same session dir (/tmp/gphotos-cdp), so we don't have to auth at every run.")
+	downloadDirFlag          = flag.String("dldir", "", "where to write the downloads. defaults to $HOME/Downloads/gphotos-cdp.")
+	profileFlag              = flag.String("profile", "", "like -dev, but with a user-provided profile dir")
+	fromFlag                 = flag.String("from", "", "earliest date to sync (YYYY-MM-DD)")
+	toFlag                   = flag.String("to", "", "latest date to sync (YYYY-MM-DD)")
+	untilFlag                = flag.String("until", "", "stop syncing at this photo")
+	runFlag                  = flag.String("run", "", "the program to run on each downloaded item, right after it is dowloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
+	verboseFlag              = flag.Bool("v", false, "be verbose")
+	headlessFlag             = flag.Bool("headless", false, "Start chrome browser in headless mode (must use -dev and have already authenticated).")
+	jsonLogFlag              = flag.Bool("json", false, "output logs in JSON format")
+	logLevelFlag             = flag.String("loglevel", "", "log level: debug, info, warn, error, fatal, panic")
+	removedFlag              = flag.Bool("removed", false, "save list of files found locally that appear to be deleted from Google Photos")
+	workersFlag              = flag.Int64("workers", 1, "number of concurrent downloads allowed")
+	albumIdFlag              = flag.String("album", "", "ID of album to download, has no effect if lastdone file is found or if -start contains full URL")
+	albumTypeFlag            = flag.String("albumtype", "album", "type of album to download (as seen in URL), has no effect if lastdone file is found or if -start contains full URL")
+	batchSizeFlag            = flag.Int("batchsize", 0, "number of photos to download in one batch")
+	execPathFlag             = flag.String("execpath", "", "path to Chrome/Chromium binary to use")
+	alreadyDownloadedIdsFile = flag.String("downloadlist", "", "path to file containing list of already downloaded files (one per lime)")
 )
 
 const gphotosUrl = "https://photos.google.com"
@@ -95,6 +98,7 @@ var errUnexpectedDownload = errors.New("unexpected download")
 var fromDate time.Time
 var toDate time.Time
 var loc GPhotosLocale
+var alreadyDownloadedIds map[string]struct{}
 
 func main() {
 	zerolog.TimestampFieldName = "dt"
@@ -122,6 +126,14 @@ func main() {
 	}
 	if *albumIdFlag != "" && (*fromFlag != "" || *toFlag != "") {
 		log.Fatal().Msg("-from and -to cannot be used with -album")
+	}
+	if *alreadyDownloadedIdsFile != "" {
+		if _, err := os.Stat(*alreadyDownloadedIdsFile); err != nil {
+			log.Fatal().Msgf("could not find file %s: %v", *alreadyDownloadedIdsFile, err)
+		} else {
+			log.Debug().Msgf("using already downloaded ids file %s", *alreadyDownloadedIdsFile)
+			initPreviouslyDownloadedList(*alreadyDownloadedIdsFile)
+		}
 	}
 
 	// Set XDG_CONFIG_HOME and XDG_CACHE_HOME to a temp dir to solve issue in newer versions of Chromium
@@ -204,6 +216,35 @@ func main() {
 	}
 
 	log.Info().Msg("Done")
+}
+
+func initPreviouslyDownloadedList(path string) {
+	// Open the file
+	file, err := os.Open(path)
+	if err != nil {
+		fmt.Println("Error opening file:", err)
+		return
+	}
+	defer file.Close()
+
+	// Use a map for fast lookups
+	idMap := make(map[string]struct{})
+
+	// Read the file line by line
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		if scanner.Text() == "" {
+			continue
+		}
+		idMap[scanner.Text()] = struct{}{} // Use an empty struct to save memory
+	}
+
+	// Check for errors in scanning
+	if err := scanner.Err(); err != nil {
+		fmt.Println("Error reading file:", err)
+	}
+
+	alreadyDownloadedIds = idMap
 }
 
 type PhotoData struct {
@@ -961,6 +1002,8 @@ func requestDownload(ctx context.Context, log zerolog.Logger, original bool, has
 			return fmt.Errorf("failed to request download after %d tries, %w, %w", i, errCouldNotPressDownloadButton, err)
 		} else if errors.Is(err, errCouldNotPressDownloadButton) || errors.Is(err, context.DeadlineExceeded) {
 			log.Debug().Msgf("trying to request download again after error: %v", err)
+		} else if errors.As(err, new(*json.InvalidUnmarshalError)) {
+			log.Warn().Msgf("Unmarshall json error: %v", err)
 		} else {
 			return fmt.Errorf("encountered error '%s' when requesting download", err.Error())
 		}
@@ -1295,6 +1338,7 @@ progressLoop:
 
 // processDownload creates a directory in s.downloadDir with name = imageId and moves the downloaded files into that directory
 func (s *Session) processDownload(log zerolog.Logger, downloadInfo NewDownload, isOriginal, hasOriginal bool, imageId string, data PhotoData) error {
+	// TODO: look for 'Download all X photos' for stacked images
 	log.Trace().Msgf("entering processDownload")
 	start := time.Now()
 
@@ -1912,6 +1956,11 @@ syncAllLoop:
 
 func (s *Session) isNewItem(log zerolog.Logger, imageId string, markFound bool) (bool, error) {
 	if _, exists := s.foundItems.Load(imageId); exists {
+		return false, nil
+	}
+
+	if _, exists := alreadyDownloadedIds[imageId]; exists {
+		log.Info().Msgf("item %s already downloaded according to input file, skipping", imageId)
 		return false, nil
 	}
 
